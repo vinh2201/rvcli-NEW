@@ -246,12 +246,29 @@ internal object PatchCommand : Callable<Int> {
     @CommandLine.Option(
         names = ["--clean"],
         description = [
-            "Clean the APK at zip level before patching (no apktool, no aapt2): removes the junk files of the " +
-                    "\"APK Junk Cleanup\" patch. Any other --clean-* option also turns the cleaning step on.",
+            "Clean the APK at zip level before patching (no apktool, no aapt2): removes safe junk files " +
+                    "(licenses, notices, .proto, tracker lists). Files used by the resource table, res/ and assets/ are never touched. " +
+                    "Any other --clean-* option also turns the cleaning step on.",
         ],
         showDefaultValue = ALWAYS,
     )
     private var clean = false
+
+    @CommandLine.Option(
+        names = ["--clean-aggressive"],
+        description = [
+            "Also remove library version/metadata files (*.properties, *.version), kotlin/, org/joda/, com/clevertap/, services/, " +
+                    "assets/audience_network* and every other META-INF entry. Some apps read these at runtime and crash without them.",
+        ],
+        showDefaultValue = ALWAYS,
+    )
+    private var cleanAggressive = false
+
+    @CommandLine.Option(
+        names = ["--clean-protect"],
+        description = ["Comma separated paths or globs that the cleaning step must never delete, for example play-services-base.properties,*.kotlin_module."],
+    )
+    private var cleanProtect: String? = null
 
     @CommandLine.Option(
         names = ["--clean-keep-abi"],
@@ -389,6 +406,8 @@ internal object PatchCommand : Callable<Int> {
 
         val cleanOptions = ApkCleaner.Options().apply {
             junk = clean
+            aggressive = cleanAggressive
+            protect = cleanProtect
             keepAbi = cleanKeepAbi
             dropBaseline = cleanDropBaseline
             adsAssets = cleanAdsAssets

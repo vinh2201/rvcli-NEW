@@ -16,6 +16,22 @@ public final class ApkCleaner {
     static final String[] PROTECTED = {
         ".*META-INF/MANIFEST\\.MF$", ".*META-INF/services/.*", ".*META-INF/.*\\.(RSA|SF|DSA|EC|FBSIG)$",
         "^(root/)?classes\\d*\\.dex$", ".*resources\\.arsc$", ".*AndroidManifest\\.xml$",
+        // read at runtime by libraries (Compose version check, kotlin-reflect, javax.activation, ...): never delete
+        "^META-INF/androidx\\.compose\\..*\\.version$", "^META-INF/.*\\.kotlin_module$", "^META-INF/mailcap.*", "^META-INF/mimetypes.*",
+        "^META-INF/native/.*", "^META-INF/resources/.*",
+    };
+
+    // ---- From the original "APK Junk Cleanup" patch: for these apps the files in EXCLUDED_ROOT_CALLS made the app crash, so they are kept.
+    // com.facebook.katana was added: Messenger (same code base) crashed without them, and these files are only ~3 KB in total.
+    static final String[] EXCLUDED_PACKAGES = { "com.viber.voip", "com.facebook.orca", "com.whatsapp", "com.zing.zalo", "com.facebook.katana" };
+    static final String[] EXCLUDED_ROOT_CALLS = {
+        "play-services-auth.properties", "play-services-auth-api-phone.properties", "play-services-auth-base.properties",
+        "play-services-base.properties", "play-services-cloud-messaging.properties", "play-services-gcm.properties",
+        "play-services-tasks.properties", "firebase-auth.properties", "firebase-auth-interop.properties", "firebase-common.properties",
+        "firebase-components.properties", "firebase-core.properties", "firebase-database.properties", "firebase-datatransport.properties",
+        "firebase-inappmessaging.properties", "firebase-inappmessaging-display.properties", "firebase-messaging.properties",
+        "core-common.properties", "META-INF/androidx.compose.ui_ui.version", "androidannotations-api.properties", "jetty-dir.css",
+        "feature-delivery.properties", "feature-delivery-base.properties",
     };
 // GENERATED from ApkJunkClean.kt (rv-NEW-patch22)
     static final String[] JUNK_REGEX = {
@@ -455,12 +471,20 @@ public final class ApkCleaner {
         public String langs;
         /** Lossless PNG re-compression. */
         public boolean png;
+        /**
+         * Also apply the riskier rules (implies junk): library version/metadata files (*.properties, *.version, ...) and the folders
+         * kotlin/, org/joda/, com/clevertap/, services/, assets/audience_network*, and every other META-INF entry.
+         * Some apps read these at runtime and crash or misbehave without them.
+         */
+        public boolean aggressive;
+        /** Comma separated extra paths/globs that must never be deleted (* = any characters, ? = one character), e.g. "play-services-base.properties,*.kotlin_module". */
+        public String protect;
         /** true = only list what would be removed and write nothing (out may be null). */
         public boolean dryRun;
 
         /** true when this run has anything to do (any option beyond defaults is set). */
         public boolean hasWork() {
-            return junk || notEmpty(keepAbi) || dropBaseline || adsAssets || manifestAds || notEmpty(langs) || png;
+            return junk || aggressive || notEmpty(keepAbi) || dropBaseline || adsAssets || manifestAds || notEmpty(langs) || png;
         }
     }
 
@@ -486,6 +510,8 @@ public final class ApkCleaner {
                 case "--keep-abi": o.keepAbi = args[++i]; break;
                 case "--drop-baseline": o.dropBaseline = true; break;
                 case "--no-junk": o.junk = false; break;
+                case "--aggressive": o.aggressive = true; break;
+                case "--protect": o.protect = args[++i]; break;
                 case "--ads-assets": o.adsAssets = true; break;
                 case "--manifest-ads": o.manifestAds = true; break;
                 case "--manifest-generic-perms": o.genericPerms = true; break;
@@ -511,8 +537,12 @@ public final class ApkCleaner {
         }
         Set<String> keepAbi = csv(opt.keepAbi, false); if (keepAbi.isEmpty()) keepAbi = null;
         Set<String> langs = csv(opt.langs, true); if (langs.isEmpty()) langs = null;
-        List<Pattern> prot = compile(PROTECTED), junk = opt.junk ? compile(JUNK_REGEX) : new ArrayList<>();
-        Set<String> exact = opt.junk ? new HashSet<>(Arrays.asList(EXACT_JUNK)) : new HashSet<>();
+        boolean junkOn = opt.junk || opt.aggressive;
+        Ctx cx = new Ctx(); cx.keepAbi = keepAbi; cx.dropBaseline = opt.dropBaseline; cx.junkOn = junkOn; cx.aggressive = opt.aggressive;
+        cx.prot = compile(PROTECTED);
+        for (String g : csv(opt.protect, false)) cx.userProtect.add(Pattern.compile(globToRegex(g)));
+        for (String re : JUNK_REGEX) (isTier2Regex(re) ? cx.junk2 : cx.junk1).add(Pattern.compile(re));
+        for (String s : EXACT_JUNK) (isTier2Name(s) ? cx.exact2 : cx.exact1).add(s);
         boolean dryRun = opt.dryRun;
 
         Result res = new Result(); res.inputSize = in.length();
@@ -526,6 +556,19 @@ public final class ApkCleaner {
             Map<String, byte[]> repl = new HashMap<>();
             Map<String, Ent> byName = new HashMap<>(); for (Ent e : all) byName.put(e.sname, e);
 
+            if (junkOn) {
+                Ent me0 = byName.get("AndroidManifest.xml");
+                String pkg = null;
+                if (me0 != null) { try { pkg = readPackage(readEntry(f, me0)); } catch (RuntimeException ex) { notes.add("WARNING: could not read the package name: " + ex.getMessage()); } }
+                cx.excludedApp = pkg != null && Arrays.asList(EXCLUDED_PACKAGES).contains(pkg);
+                Ent ae0 = byName.get("resources.arsc");
+                if (ae0 != null) {
+                    try { cx.refs = arscRefs(readEntry(f, ae0), names); }
+                    catch (RuntimeException ex) { cx.shieldDeep = true; notes.add("WARNING: could not read resources.arsc (" + ex.getMessage() + "): all files in sub-folders are protected from junk rules"); }
+                }
+                notes.add("Junk rules: package " + pkg + (cx.excludedApp ? " is on the exclusion list: " + EXCLUDED_ROOT_CALLS.length + " known-sensitive library files are kept" : "")
+                        + "; " + cx.refs.size() + " files used by the resource table are protected" + (opt.aggressive ? "; AGGRESSIVE mode" : "; safe mode (add --clean-aggressive for version files, kotlin/, org/joda/, other META-INF)"));
+            }
             if (opt.manifestAds) {
                 Ent me = byName.get("AndroidManifest.xml"); List<String> rm = new ArrayList<>();
                 if (me == null) throw new IOException("AndroidManifest.xml not found in the APK");
@@ -557,10 +600,10 @@ public final class ApkCleaner {
                 boolean dir = e.sname.endsWith("/");
                 String why = null;
                 if (!dir) {
-                    if (extraDelete.containsKey(e.sname)) why = extraDelete.get(e.sname);
+                    if (cx.isUserProtected(e.sname)) why = null;
+                    else if (extraDelete.containsKey(e.sname)) why = extraDelete.get(e.sname);
                     else if (opt.adsAssets && (ADS_ASSET_1.matcher(e.sname).matches() || ADS_ASSET_2.matcher(e.sname).matches())) why = "ads assets (Ads*)";
-                    else if (opt.junk) why = reason(e.sname, prot, junk, exact, keepAbi, opt.dropBaseline);
-                    else if (keepAbi != null && e.sname.startsWith("lib/")) why = reason(e.sname, prot, new ArrayList<>(), new HashSet<>(), keepAbi, opt.dropBaseline);
+                    else why = reason(e.sname, cx);
                 }
                 if (why != null) {
                     res.removedFiles++; res.removedBytes += e.usize; res.removedCompressedBytes += e.csize;
@@ -630,23 +673,104 @@ public final class ApkCleaner {
         }
     }
 
-    static String reason(String n, List<Pattern> prot, List<Pattern> junk, Set<String> exact, Set<String> keepAbi, boolean dropBaseline) {
-        for (Pattern p : prot) if (p.matcher(n).matches()) return null;
-        if (keepAbi != null && n.startsWith("lib/")) {
-            String[] sp = n.split("/");
-            if (sp.length > 2 && !keepAbi.contains(sp[1])) return "other CPU lib";
+    /** State shared by the per-entry rules of one run. */
+    static final class Ctx {
+        List<Pattern> prot = new ArrayList<>(), userProtect = new ArrayList<>(), junk1 = new ArrayList<>(), junk2 = new ArrayList<>();
+        Set<String> exact1 = new HashSet<>(), exact2 = new HashSet<>(), keepAbi, refs = new HashSet<>();
+        boolean dropBaseline, junkOn, aggressive, excludedApp, shieldDeep;
+        boolean isUserProtected(String n) { for (Pattern p : userProtect) if (p.matcher(n).matches()) return true; return false; }
+    }
+
+    /** Tier 2 = library version/metadata files that some SDKs read at runtime (crash evidence from the original patch's exclusion list). */
+    static boolean isTier2Regex(String re) { return re.contains("properties$") || re.equals(".*\\.version$") || re.equals(".*_VERSION$") || re.contains("jetty-dir"); }
+    static boolean isTier2Name(String s) { return s.endsWith(".properties") || s.equals("jetty-dir.css"); }
+
+    static String globToRegex(String g) {
+        StringBuilder sb = new StringBuilder();
+        for (char c : g.trim().toCharArray()) {
+            if (c == '*') sb.append(".*"); else if (c == '?') sb.append('.');
+            else { if ("\\.[]{}()+-^$|".indexOf(c) >= 0) sb.append('\\'); sb.append(c); }
         }
-        for (Pattern p : junk) if (p.matcher(n).matches()) return "junk pattern";
-        if (exact.contains(n)) return "junk file name";
-        if (junk.isEmpty()) return null; // che do chi loc ABI
+        return sb.toString();
+    }
+
+    /** Returns the reason a file is removed, or null to keep it. */
+    static String reason(String n, Ctx c) {
+        for (Pattern p : c.prot) if (p.matcher(n).matches()) return null;
+        // CPU architecture filter (explicit user option, not a junk rule)
+        if (c.keepAbi != null && n.startsWith("lib/")) {
+            String[] sp = n.split("/");
+            if (sp.length > 2 && !c.keepAbi.contains(sp[1])) return "other CPU lib";
+        }
+        if (c.dropBaseline && n.startsWith("assets/dexopt/")) return "baseline profile";
+        if (!c.junkOn) return null;
+        // folders that are only removed in aggressive mode
+        if (c.aggressive) {
+            if (n.equals("assets/audience_network.dex") || n.startsWith("assets/audience_network/")) return "audience_network";
+        }
+        // shield: resources, assets, native libs and anything the resource table points to are never "junk"
+        if (n.startsWith("res/") || n.startsWith("assets/") || n.startsWith("lib/") || c.refs.contains(n)) return null;
+        if (c.shieldDeep && n.indexOf('/') > 0 && !n.startsWith("META-INF/")) return null;
+        // some apps are known to crash without these files (original patch exclusion list)
+        if (c.excludedApp && Arrays.asList(EXCLUDED_ROOT_CALLS).contains(n)) return null;
+        for (Pattern p : c.junk1) if (p.matcher(n).matches()) return "junk pattern (safe)";
+        if (c.exact1.contains(n)) return "junk file name (safe)";
+        if (!c.aggressive) return null;
+        for (Pattern p : c.junk2) if (p.matcher(n).matches()) return "library metadata pattern";
+        if (c.exact2.contains(n)) return "library metadata name";
         if (n.startsWith("kotlin/")) return "kotlin/ folder";
-        if (n.equals("assets/audience_network.dex") || n.startsWith("assets/audience_network/")) return "audience_network";
         for (String d : JUNK_DIRS) {
-            if (d.equals("assets/dexopt/") && !dropBaseline) continue;
+            if (d.equals("assets/dexopt/")) continue;
             if (n.startsWith(d)) return "junk folder " + d;
         }
         if (n.startsWith("META-INF/")) return "other META-INF";
         return null;
+    }
+
+    /** Package name from the binary AndroidManifest.xml (attribute "package" of the manifest element), or null. */
+    static String readPackage(byte[] m) {
+        if (m.length < 16 || u16(m, 0) != 0x0003) return null;
+        String[] pool = null; int p = u16(m, 2);
+        while (p + 8 <= m.length) {
+            int type = u16(m, p), size = i32(m, p + 4); if (size <= 0) break;
+            if (type == 0x0001 && pool == null) pool = readPool(m, p);
+            if (type == 0x0102 && pool != null) {
+                int ni = i32(m, p + 20); if (ni < 0 || ni >= pool.length || !"manifest".equals(pool[ni])) return null;
+                int attrStart = u16(m, p + 24), attrSize = u16(m, p + 26), attrCount = u16(m, p + 28);
+                for (int i = 0; i < attrCount; i++) {
+                    int ao = p + 16 + attrStart + i * attrSize;
+                    int ns = i32(m, ao), an = i32(m, ao + 4);
+                    if (ns == -1 && an >= 0 && an < pool.length && "package".equals(pool[an])) {
+                        int raw = i32(m, ao + 8); if (raw >= 0 && raw < pool.length) return pool[raw];
+                    }
+                }
+                return null;
+            }
+            p += size;
+        }
+        return null;
+    }
+
+    /** Every zip path that the resource table points to (res files, raw files, xml, drawables...). */
+    static Set<String> arscRefs(byte[] a, Set<String> zipNames) {
+        if (a.length < 12 || u16(a, 0) != 0x0002) throw new IllegalArgumentException("invalid resources.arsc");
+        Set<String> all = new HashSet<>(); String[] gpool = null;
+        int total = (int) Math.min(u32(a, 4), a.length), p = u16(a, 2);
+        while (p + 8 <= total) {
+            int type = u16(a, p), size = i32(a, p + 4); if (size <= 0) throw new IllegalStateException("chunk size <= 0");
+            if (type == 0x0001 && gpool == null) gpool = readPool(a, p);
+            else if (type == 0x0200) {
+                int q = p + u16(a, p + 2), end = p + size;
+                while (q + 8 <= end) {
+                    int t = u16(a, q), s = i32(a, q + 4); if (s <= 0) throw new IllegalStateException("inner chunk size <= 0");
+                    if (t == 0x0201) collectRefs(a, q, gpool, all);
+                    q += s;
+                }
+            }
+            p += size;
+        }
+        Set<String> out = new HashSet<>(); for (String s : all) if (zipNames.contains(s)) out.add(s);
+        return out;
     }
 
     static class CountingOut extends FilterOutputStream {
