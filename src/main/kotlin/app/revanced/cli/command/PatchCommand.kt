@@ -244,21 +244,24 @@ internal object PatchCommand : Callable<Int> {
     // region APK cleaning
 
     @CommandLine.Option(
-        names = ["--clean"],
+        names = ["--clean-safe"],
         description = [
-            "Clean the APK at zip level before patching (no apktool, no aapt2): removes safe junk files " +
-                    "(licenses, notices, .proto, tracker lists). Files used by the resource table, res/ and assets/ are never touched. " +
-                    "Any other --clean-* option also turns the cleaning step on.",
+            "Safe clean of the APK at zip level before patching (no apktool, no aapt2): removes junk files " +
+                    "(licenses, notices, .proto, tracker lists, version marker files of ad/analytics/Play Services libraries, org/jacoco/, " +
+                    "META-INF/maven and proguard). Files used by the resource table, res/ and assets/ are never touched, " +
+                    "and the library files known to crash some apps are kept unless --clean-aggressive is set. " +
+                    "Any other --clean-* option and --lower-sdk also turn the zip-level step on.",
         ],
         showDefaultValue = ALWAYS,
     )
-    private var clean = false
+    private var cleanSafe = false
 
     @CommandLine.Option(
         names = ["--clean-aggressive"],
         description = [
-            "Also remove library version/metadata files (*.properties, *.version), kotlin/, org/joda/, com/clevertap/, services/, " +
-                    "assets/audience_network* and every other META-INF entry. Some apps read these at runtime and crash without them.",
+            "Also remove the library files known to crash some apps (play-services-auth/base/tasks, firebase-common/messaging, core-common, ...), " +
+                    "kotlin/, org/joda/, com/clevertap/, services/, assets/audience_network* and every other META-INF entry. " +
+                    "Some apps read these at runtime and crash without them.",
         ],
         showDefaultValue = ALWAYS,
     )
@@ -314,6 +317,17 @@ internal object PatchCommand : Callable<Int> {
     private var cleanPng = false
 
     @CommandLine.Option(
+        names = ["--clean-dpi"],
+        description = [
+            "Comma separated screen densities to keep for images that exist in several densities, for example xxhdpi " +
+                    "or xhdpi,xxhdpi (names ldpi, mdpi, tvdpi, hdpi, xhdpi, xxhdpi, xxxhdpi or a number such as 420). " +
+                    "For every image only the copy Android would pick for those densities is kept; the other copies are removed " +
+                    "from resources.arsc and their files deleted. Resource ids do not change.",
+        ],
+    )
+    private var cleanDpi: String? = null
+
+    @CommandLine.Option(
         names = ["--clean-drop-baseline"],
         description = ["Also delete assets/dexopt/ (baseline profile). Startup can get slower."],
         showDefaultValue = ALWAYS,
@@ -326,6 +340,16 @@ internal object PatchCommand : Callable<Int> {
         showDefaultValue = ALWAYS,
     )
     private var cleanDryRun = false
+
+    @CommandLine.Option(
+        names = ["--lower-sdk"],
+        paramLabel = "<API level>",
+        description = [
+            "Lower minSdkVersion in AndroidManifest.xml to this API level, for example --lower-sdk 26 (Android 8.0). " +
+                    "Only the manifest is edited, the app code is not changed. It never raises the value.",
+        ],
+    )
+    private var lowerSdk = 0
 
     // endregion
 
@@ -405,7 +429,7 @@ internal object PatchCommand : Callable<Int> {
         // region Clean the APK
 
         val cleanOptions = ApkCleaner.Options().apply {
-            junk = clean
+            junk = cleanSafe
             aggressive = cleanAggressive
             protect = cleanProtect
             keepAbi = cleanKeepAbi
@@ -415,11 +439,13 @@ internal object PatchCommand : Callable<Int> {
             genericPerms = cleanGenericPerms
             langs = cleanLangs
             png = cleanPng
+            dpi = cleanDpi
+            minSdk = lowerSdk
             dryRun = cleanDryRun
         }
 
         val inputApk = if (cleanOptions.hasWork()) {
-            logger.info("Cleaning the APK at zip level")
+            logger.info("Preparing the APK at zip level (clean / lower-sdk)")
 
             val cleanedApk = temporaryFilesPath.resolve("cleaned").resolve(apk.name)
 
@@ -440,6 +466,57 @@ internal object PatchCommand : Callable<Int> {
 
         // endregion
 
+        // region Patch and save
+
+        // Patch and save in a separate function so that, once it returns, nothing references the
+        // patcher any more. The patcher never closes the APK it opens, so this lets the garbage
+        // collector release the handle on the (temporary) cleaned APK before the purge below.
+        val packageName = patchAndSave(inputApk, patches, temporaryFilesPath, outputFilePath, keystoreFilePath)
+
+        logger.info("Saved to $outputFilePath")
+
+        // endregion
+
+        // region Install.
+
+        installation?.deviceSerial?.let {
+            runBlocking {
+                when (val result =
+                    installer!!.install(Installer.Apk(outputFilePath, packageName))) {
+                    RootInstallerResult.FAILURE -> logger.severe("Failed to mount the patched APK file")
+                    is AdbInstallerResult.Failure -> logger.severe(result.exception.toString())
+                    else -> logger.info("Installed the patched APK file")
+                }
+            }
+        }
+
+        // endregion
+
+        if (purge) {
+            logger.info("Purging temporary files")
+            purge(temporaryFilesPath)
+        }
+
+        return 0
+    }
+
+    /**
+     * Applies the selected patches to [inputApk], signs the result and writes it to [outputFilePath].
+     *
+     * This is a function of its own on purpose. The patcher opens [inputApk] (apktool's ExtFile) and never closes it.
+     * On Windows an open file cannot be deleted, so when [inputApk] is the cleaned APK in the temporary
+     * directory, `--purge` could not remove it. When this function returns, nothing references the patcher
+     * any more and the garbage collector is free to close that handle (see [purge]).
+     *
+     * @return The package name of the patched app.
+     */
+    private fun patchAndSave(
+        inputApk: File,
+        patches: Set<Patch>,
+        temporaryFilesPath: File,
+        outputFilePath: File,
+        keystoreFilePath: File,
+    ): String {
         val patcherTemporaryFilesPath = temporaryFilesPath.resolve("patcher")
 
         lateinit var packageName: String
@@ -480,8 +557,6 @@ internal object PatchCommand : Callable<Int> {
             }
         }
 
-        // region Save.
-
         inputApk.copyTo(temporaryFilesPath.resolve(apk.name), overwrite = true).let {
             patchesResult.applyTo(it)
 
@@ -502,31 +577,7 @@ internal object PatchCommand : Callable<Int> {
             }
         }
 
-        logger.info("Saved to $outputFilePath")
-
-        // endregion
-
-        // region Install.
-
-        installation?.deviceSerial?.let {
-            runBlocking {
-                when (val result =
-                    installer!!.install(Installer.Apk(outputFilePath, packageName))) {
-                    RootInstallerResult.FAILURE -> logger.severe("Failed to mount the patched APK file")
-                    is AdbInstallerResult.Failure -> logger.severe(result.exception.toString())
-                    else -> logger.info("Installed the patched APK file")
-                }
-            }
-        }
-
-        // endregion
-
-        if (purge) {
-            logger.info("Purging temporary files")
-            purge(temporaryFilesPath)
-        }
-
-        return 0
+        return packageName
     }
 
     /**
@@ -597,13 +648,43 @@ internal object PatchCommand : Callable<Int> {
         }
     }
 
+    /**
+     * Deletes the temporary files directory, including the cleaned APK created by the `--clean*` options.
+     *
+     * On Windows a file that is still open cannot be deleted. The patcher opens the APK it patches and never
+     * closes it, and an antivirus scanner can hold a fresh file for a moment as well. So when deleting fails,
+     * ask the garbage collector to run (the JDK closes unreachable zip and file handles by itself), wait a
+     * little longer each round and try again, instead of silently leaving the APK behind.
+     */
     private fun purge(resourceCachePath: File) {
-        val result =
+        val attempts = 6
+
+        for (attempt in 1..attempts) {
             if (resourceCachePath.deleteRecursively()) {
-                "Purged resource cache directory"
-            } else {
-                "Failed to purge resource cache directory"
+                logger.info("Purged resource cache directory")
+
+                return
             }
-        logger.info(result)
+
+            if (attempt == attempts) break
+
+            System.gc()
+
+            try {
+                Thread.sleep(250L * attempt)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+
+                break
+            }
+        }
+
+        val leftovers = resourceCachePath.walkTopDown().filter { it.isFile }.take(3).toList()
+
+        logger.warning(
+            "Failed to purge resource cache directory. " +
+                "Another program may still be using: ${leftovers.joinToString { it.path }}. " +
+                "Delete ${resourceCachePath.path} manually.",
+        )
     }
 }

@@ -142,6 +142,42 @@ java -jar revanced-cli.jar patch -bp patches.rvp -i "Patch name" -Okey1 input.ap
 > java -jar revanced-cli.jar -bp patches.rvp -e "Patch name" -OstringKey=\'1\' input.apk
 > ```
 
+## 🧹 NEW SPECIAL COMMAND-IN-LINE
+
+Extra options of the `patch` command added in this fork. They work on the APK file itself (zip level, no apktool and no aapt2), **before** the patches are applied, so the patches then run on the already cleaned APK. Using any option of this group turns that step on; without any of them `patch` behaves as before. If this step fails, the command stops and nothing is patched.
+
+| Option | Value | What it does | Example |
+|---|---|---|---|
+| `--clean-safe` | none | Removes junk files that are safe to remove: licenses and notices, `.proto` files, tracker lists, version marker files of ad / analytics / Play Services libraries, `org/jacoco/`, `META-INF/maven` and `META-INF/proguard`. Files used by `res/`, `assets/`, `lib/` and by `resources.arsc` are never touched. | `--clean-safe` |
+| `--clean-aggressive` | none | Also removes the risky group: library files known to crash some apps, `kotlin/`, `org/joda/`, `com/clevertap/`, `services/`, `assets/audience_network*` and the other `META-INF` entries. | `--clean-aggressive` |
+| `--clean-protect` | comma separated paths or globs (`*` many characters, `?` one) | Paths the cleaning must never delete. Use it when an app breaks because a file is missing. | `--clean-protect play-services-base.properties,*.kotlin_module` |
+| `--clean-keep-abi` | comma separated CPU ABIs | Keeps only these ABIs in `lib/`, removes the others. | `--clean-keep-abi armeabi-v7a` |
+| `--clean-ads-assets` | none | Deletes `assets/Ads*` and `assets/*Ads*Configs.json`. | `--clean-ads-assets` |
+| `--clean-manifest-ads` | none | Removes ad SDK permissions, services, receivers, providers, activities, activity aliases, meta-data and libraries from `AndroidManifest.xml`. | `--clean-manifest-ads` |
+| `--clean-generic-perms` | none | Together with `--clean-manifest-ads`: also removes generic permissions (`CHANGE_NETWORK_STATE`, `CHANGE_WIFI_STATE`, ...). Risky: features that use them can crash. | `--clean-manifest-ads --clean-generic-perms` |
+| `--clean-langs` | comma separated language codes | Keeps only these languages, removes the other translations. `en-US` and `en-rUS` mean `en` (all regions of a language are kept). | `--clean-langs en,vi` |
+| `--clean-dpi` | comma separated densities: `ldpi` `mdpi` `tvdpi` `hdpi` `xhdpi` `xxhdpi` `xxxhdpi` or a number | Remove duplicate graphics: an image that exists in several screen densities keeps only the copy Android would pick for the given densities; the other copies and their files are removed. Resource ids do not change. | `--clean-dpi xxhdpi` or `--clean-dpi xhdpi,xxhdpi` or `--clean-dpi 420` |
+| `--clean-png` | none | Re-compresses PNG files without losing quality. | `--clean-png` |
+| `--clean-drop-baseline` | none | Also deletes `assets/dexopt/` (baseline profile). Startup can get slower. | `--clean-drop-baseline` |
+| `--clean-dry-run` | none | Only lists what the cleaning would remove, writes nothing and does not patch. | `--clean-safe --clean-dry-run` |
+| `--lower-sdk` | API level (a number) | Lowers `minSdkVersion` in `AndroidManifest.xml` to this number. It never raises it. Only the manifest is edited, the code is not changed. A warning is printed when the APK has dex files newer than Android 8 can read. | `--lower-sdk 26` |
+
+`--purge` also deletes the temporary cleaned APK, together with the other temporary files.
+
+Example with several of them (the value goes after a space, or after `=`):
+
+```bash
+java -jar revanced-cli.jar patch -bp patches.rvp --purge \
+  --clean-safe --clean-keep-abi armeabi-v7a --clean-ads-assets --clean-manifest-ads \
+  --clean-langs en,vi --clean-dpi xxhdpi --lower-sdk 26 input.apk
+```
+
+> [!TIP]
+> Run it once with `--clean-dry-run` first (for example `--clean-safe --clean-langs en,vi --clean-dry-run`) to see the list of what would be removed.
+
+> [!WARNING]
+> `--clean-aggressive`, `--clean-generic-perms` and `--clean-dpi` can break or blur an app on some devices. `--lower-sdk` does not make the code compatible with older Android versions.
+
 ## 📦 Install an app manually
 
 ```bash

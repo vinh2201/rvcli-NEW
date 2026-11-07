@@ -45,7 +45,7 @@ jobs:
       - name: Upload Patches Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: revanced-patches-output
+          name: revanced-cli-output
           # Dùng ký tự ** để quét file .jar và .rvp ở mọi thư mục con, tránh việc sai lệch đường dẫn
           path: |
             build/libs/revanced-cli*.jar

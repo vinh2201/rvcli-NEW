@@ -318,26 +318,28 @@ public final class ApkCleaner {
     static String matchElement(byte[] m, int p, String[] pool, boolean generic) {
         int ni = i32(m, p + 20); if (ni < 0 || ni >= pool.length) return null;
         String tag = pool[ni];
-        switch (tag) { case "uses-permission": case "uses-library": case "property": case "meta-data":
-            case "provider": case "service": case "receiver": case "activity": break; default: return null; }
+        switch (tag) { case "uses-permission": case "uses-permission-sdk-23": case "uses-permission-sdk-m": case "uses-library": case "property": case "meta-data":
+            case "provider": case "service": case "receiver": case "activity": case "activity-alias": break; default: return null; }
         int attrStart = u16(m, p + 24), attrSize = u16(m, p + 26), attrCount = u16(m, p + 28);
-        String name = "", value = "";
+        String name = "", value = "", target = "";
         for (int i = 0; i < attrCount; i++) {
             int ao = p + 16 + attrStart + i * attrSize;
             int ns = i32(m, ao), an = i32(m, ao + 4);
             if (an < 0 || an >= pool.length || ns < 0 || ns >= pool.length || !ANDROID_NS.equals(pool[ns])) continue;
             int raw = i32(m, ao + 8), dt = u8(m, ao + 15), data = i32(m, ao + 16);
             String sv = (raw >= 0 && raw < pool.length) ? pool[raw] : ((dt == 3 && data >= 0 && data < pool.length) ? pool[data] : "");
-            if (pool[an].equals("name")) name = sv; else if (pool[an].equals("value")) value = sv;
+            if (pool[an].equals("name")) name = sv; else if (pool[an].equals("value")) value = sv; else if (pool[an].equals("targetActivity")) target = sv;
         }
         boolean rm;
         switch (tag) {
-            case "uses-permission": rm = AD_PERMS.contains(name) || (generic && GENERIC_PERMS.contains(name)); break;
+            case "uses-permission": case "uses-permission-sdk-23": case "uses-permission-sdk-m":
+                rm = AD_PERMS.contains(name) || (generic && GENERIC_PERMS.contains(name)); break;
             case "uses-library": rm = name.equals("android.ext.adservices"); break;
             case "property": rm = name.equals("android.adservices.AD_SERVICES_CONFIG"); break;
-            default: rm = false; for (String pf : AD_NAMES) if (name.startsWith(pf) || value.startsWith(pf)) { rm = true; break; }
+            // activity-alias: also drop an alias whose target activity is an ad activity, otherwise the manifest has an alias pointing to nothing (install fails)
+            default: rm = false; for (String pf : AD_NAMES) if (name.startsWith(pf) || value.startsWith(pf) || target.startsWith(pf)) { rm = true; break; }
         }
-        return rm ? tag + " " + (name.isEmpty() ? value : name) : null;
+        return rm ? tag + " " + (name.isEmpty() ? (value.isEmpty() ? target : value) : name) : null;
     }
 
     // ---------------------------------------------------------------- resources.arsc: go khoi ngon ngu khong can
@@ -406,6 +408,327 @@ public final class ApkCleaner {
         return r;
     }
 
+    // ---------------------------------------------------------------- minSdkVersion (--lower-sdk)
+    /**
+     * Lowers minSdkVersion in the binary AndroidManifest.xml. It only rewrites the value of the existing attribute (same size), so the string
+     * pool and all chunk sizes stay as they are. It never raises the value.
+     */
+    static byte[] lowerMinSdk(byte[] m, int newMin, List<String> notes) {
+        if (m.length < 16 || u16(m, 0) != 0x0003) throw new IllegalArgumentException("Manifest is not binary XML (already decoded?)");
+        String[] pool = null; int p = u16(m, 2);
+        while (p + 8 <= m.length) {
+            int type = u16(m, p), size = i32(m, p + 4); if (size <= 0) break;
+            if (type == 0x0001 && pool == null) pool = readPool(m, p);
+            else if (type == 0x0102 && pool != null) {
+                int ni = i32(m, p + 20);
+                if (ni >= 0 && ni < pool.length && pool[ni].equals("uses-sdk")) {
+                    int attrStart = u16(m, p + 24), attrSize = u16(m, p + 26), attrCount = u16(m, p + 28);
+                    for (int i = 0; i < attrCount; i++) {
+                        int ao = p + 16 + attrStart + i * attrSize;
+                        int ns = i32(m, ao), an = i32(m, ao + 4);
+                        if (an < 0 || an >= pool.length || ns < 0 || ns >= pool.length || !ANDROID_NS.equals(pool[ns]) || !pool[an].equals("minSdkVersion")) continue;
+                        int dt = u8(m, ao + 15), data = i32(m, ao + 16);
+                        if (dt == 0x10 || dt == 0x11) {
+                            if (data <= newMin) { notes.add("minSdkVersion is already " + data + " (<= " + newMin + "): unchanged"); return m; }
+                            notes.add("minSdkVersion " + data + " -> " + newMin);
+                        } else if (dt == 0x03) {
+                            notes.add("minSdkVersion (preview codename) -> " + newMin);
+                        } else throw new IllegalStateException("minSdkVersion has an unexpected value type 0x" + Integer.toHexString(dt));
+                        byte[] r = m.clone();
+                        p32(r, ao + 8, -1);   // rawValue: none
+                        r[ao + 15] = 0x10;    // TYPE_INT_DEC
+                        p32(r, ao + 16, newMin);
+                        return r;
+                    }
+                    notes.add("The manifest has no minSdkVersion (it defaults to 1): nothing to lower");
+                    return m;
+                }
+            }
+            p += size;
+        }
+        notes.add("The manifest has no <uses-sdk> element (minSdkVersion defaults to 1): nothing to lower");
+        return m;
+    }
+
+    /** First bytes of an entry without reading all of it (n must be small). Null when it cannot be read. */
+    static byte[] readHead(RandomAccessFile f, Ent e, int n) throws IOException {
+        byte[] loc = new byte[30]; f.seek(e.locOff); f.readFully(loc);
+        long ds = e.locOff + 30 + u16(loc, 26) + u16(loc, 28);
+        int take = (int) Math.min(e.csize, e.method == 0 ? n : 4096);
+        byte[] raw = new byte[take]; f.seek(ds); f.readFully(raw);
+        if (e.method == 0) return raw.length > n ? Arrays.copyOf(raw, n) : raw;
+        Inflater inf = new Inflater(true); inf.setInput(raw); byte[] o = new byte[n]; int got = 0;
+        try {
+            while (got < n && !inf.finished()) {
+                int k = inf.inflate(o, got, n - got);
+                if (k == 0 && (inf.needsInput() || inf.needsDictionary())) break;
+                got += k;
+            }
+        } catch (DataFormatException ex) { return null; } finally { inf.end(); }
+        return Arrays.copyOf(o, got);
+    }
+
+    /** Lowering minSdk does not change the code: warn when a dex file is newer than what old Android versions read (038 = Android 8.0). */
+    static void warnDex(RandomAccessFile f, List<Ent> all, int newMin, List<String> notes) throws IOException {
+        int worst = 0; String where = null;
+        for (Ent e : all) {
+            String n = e.sname;
+            if (n.indexOf('/') >= 0 || !n.startsWith("classes") || !n.endsWith(".dex")) continue;
+            byte[] h = readHead(f, e, 8);
+            if (h == null || h.length < 8 || h[0] != 'd' || h[1] != 'e' || h[2] != 'x' || h[3] != '\n') continue;
+            int v = (h[4] - '0') * 100 + (h[5] - '0') * 10 + (h[6] - '0');
+            if (v > worst) { worst = v; where = n; }
+        }
+        if (worst > 38) notes.add("WARNING: " + where + " is dex format 0" + worst + ". Android 8.x only reads up to 038, so with minSdk " + newMin
+                + " the app may refuse to install or crash at start on Android older than 9. Lowering minSdk only edits the manifest, not the code.");
+    }
+
+    // ---------------------------------------------------------------- resources.arsc: bo ban sao anh cua cac mat do khong can (--clean-dpi)
+    static final String[] DPI_NAMES = {"ldpi", "mdpi", "tvdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"};
+    static final int[] DPI_VALUES = {120, 160, 213, 240, 320, 480, 640};
+    static final int DENSITY_ANY = 0xFFFE, DENSITY_NONE = 0xFFFF;
+
+    /** "xxhdpi", "420dpi" or "420" -> dpi values. */
+    static int[] parseDensities(String s) {
+        List<Integer> l = new ArrayList<>();
+        for (String t : csv(s, true)) {
+            int v = -1;
+            for (int i = 0; i < DPI_NAMES.length; i++) if (DPI_NAMES[i].equals(t)) v = DPI_VALUES[i];
+            if (v < 0) {
+                try { v = Integer.parseInt(t.endsWith("dpi") ? t.substring(0, t.length() - 3) : t); } catch (NumberFormatException ex) { v = -1; }
+            }
+            if (v < 20 || v > 1280) throw new IllegalArgumentException("density list: unknown density '" + t + "' (use ldpi, mdpi, tvdpi, hdpi, xhdpi, xxhdpi, xxxhdpi or a number such as 420)");
+            if (!l.contains(v)) l.add(v);
+        }
+        if (l.isEmpty()) throw new IllegalArgumentException("density list: no density given");
+        int[] r = new int[l.size()]; for (int i = 0; i < r.length; i++) r[i] = l.get(i); return r;
+    }
+
+    static String dpiLabel(int d) {
+        if (d == 0) return "default";
+        if (d == DENSITY_ANY) return "anydpi"; if (d == DENSITY_NONE) return "nodpi";
+        for (int i = 0; i < DPI_VALUES.length; i++) if (DPI_VALUES[i] == d) return DPI_NAMES[i];
+        return d + "dpi";
+    }
+
+    /** The density Android picks for a screen of density t among the available ones: exact, else the smallest above, else the largest below. */
+    static int bestDensity(int t, int[] av) {
+        int above = Integer.MAX_VALUE, below = -1;
+        for (int d : av) { if (d == t) return d; if (d > t) above = Math.min(above, d); else below = Math.max(below, d); }
+        return above != Integer.MAX_VALUE ? above : below;
+    }
+
+    static boolean isImagePath(String s) {
+        int d = s.lastIndexOf('.'); if (d < 0) return false;
+        String x = s.substring(d + 1).toLowerCase(Locale.ROOT);
+        return x.equals("png") || x.equals("webp") || x.equals("jpg") || x.equals("jpeg") || x.equals("gif");
+    }
+
+    static class DpiResult { byte[] data; int removedEntries, changedChunks, droppedChunks, skippedGroups; boolean refsUnsafe; Set<String> deletePaths = new TreeSet<>(); Map<String, Integer> byDensity = new TreeMap<>(); }
+
+    /** One ResTable_type chunk: the entries of one resource type for one configuration. Slot = position in the offset table (sparse: in the pair table). */
+    static final class TChunk {
+        int pos, size, hdr, pkg, typeId, flags, count, entriesStart, density, eff, slots;
+        String key;      // package + type id + the whole configuration except its density
+        int[] slotIdx;   // entry index of each slot
+        int[] eoff;      // offset of the entry (relative to entriesStart) or -1 = empty slot
+        int[] esize;     // byte size of the entry
+        String[] image;  // path when the entry is a plain reference to an image file in the APK, else null
+        boolean[] drop;
+        boolean ok;      // every entry was understood, so the chunk can be rebuilt
+        boolean any() { for (boolean b : drop) if (b) return true; return false; }
+    }
+
+    static String hex(byte[] b) { StringBuilder sb = new StringBuilder(); for (byte x : b) sb.append(String.format("%02x", x & 0xFF)); return sb.toString(); }
+
+    /** All string-pool references (file paths) of one entry. */
+    static void entryRefs(byte[] a, int e, String[] gpool, Set<String> into) {
+        int esz = u16(a, e), ef = u16(a, e + 2);
+        if ((ef & 0x01) != 0) {
+            int cnt = i32(a, e + 12);
+            for (int k = 0; k < cnt; k++) { int vo = e + esz + k * 12 + 4; if (u8(a, vo + 3) == 0x03) addRef(gpool, i32(a, vo + 4), into); }
+        } else if (u8(a, e + esz + 3) == 0x03) addRef(gpool, i32(a, e + esz + 4), into);
+    }
+
+    /** Reads a type chunk. Paths of entries that can never be removed are added to {@code kept}; image entries are decided later. */
+    static TChunk parseType(byte[] a, int q, int pkgNo, String[] gpool, Set<String> zipNames, Set<String> kept) {
+        TChunk c = new TChunk(); c.pos = q; c.pkg = pkgNo; c.hdr = u16(a, q + 2); c.size = i32(a, q + 4);
+        c.typeId = u8(a, q + 8); c.flags = u8(a, q + 9); c.count = i32(a, q + 12); c.entriesStart = i32(a, q + 16);
+        c.slots = 0; c.drop = new boolean[0];
+        try {
+            int cfg = q + 20, cfgSize = i32(a, cfg);
+            if ((c.flags & ~3) != 0 || c.count < 0 || c.count > 0xFFFF + 1 || cfgSize < 16 || cfgSize > 256 || 20 + cfgSize > c.hdr || c.entriesStart < c.hdr || c.entriesStart > c.size) return c;
+            c.density = u16(a, cfg + 14); c.eff = c.density == 0 ? 160 : c.density;
+            byte[] kb = Arrays.copyOfRange(a, cfg, cfg + cfgSize); kb[14] = 0; kb[15] = 0;
+            if (cfgSize >= 26 && u16(kb, 24) <= 4) { kb[24] = 0; kb[25] = 0; } // "-v4" (old aapt) means the same as no version
+            c.key = pkgNo + ":" + c.typeId + ":" + hex(kb);
+            boolean sparse = (c.flags & 1) != 0, off16 = (c.flags & 2) != 0;
+            int n = c.count, end = q + c.size;
+            if (q + c.hdr + (sparse ? 4 : off16 ? 2 : 4) * n > end) return c;
+            c.slots = n; c.slotIdx = new int[n]; c.eoff = new int[n]; c.esize = new int[n]; c.image = new String[n]; c.drop = new boolean[n];
+            for (int i = 0; i < n; i++) {
+                long off;
+                if (sparse) { c.slotIdx[i] = u16(a, q + c.hdr + 4 * i); off = (long) u16(a, q + c.hdr + 4 * i + 2) * 4; }
+                else if (off16) { c.slotIdx[i] = i; int v = u16(a, q + c.hdr + 2 * i); off = v == 0xFFFF ? -1 : v * 4L; }
+                else { c.slotIdx[i] = i; long v = u32(a, q + c.hdr + 4 * i); off = v == 0xFFFFFFFFL ? -1 : v; }
+                if (off < 0) { c.eoff[i] = -1; continue; }
+                int e = (int) (q + c.entriesStart + off);
+                if (off > c.size || e + 8 > end) { c.slots = 0; return c; }
+                int esz = u16(a, e), ef = u16(a, e + 2), total;
+                if ((ef & 0x08) != 0) { c.slots = 0; return c; }               // compact entry: not supported
+                if ((ef & 0x01) != 0) {
+                    if (esz < 16 || e + 16 > end) { c.slots = 0; return c; }
+                    int cnt = i32(a, e + 12); if (cnt < 0 || cnt > 100000) { c.slots = 0; return c; }
+                    total = esz + cnt * 12;
+                } else {
+                    if (esz < 8 || e + esz + 8 > end || u16(a, e + esz) != 8) { c.slots = 0; return c; }
+                    total = esz + 8;
+                }
+                if (e + total > end) { c.slots = 0; return c; }
+                c.eoff[i] = (int) off; c.esize[i] = total;
+                if ((ef & 0x01) == 0 && u8(a, e + esz + 3) == 0x03) {
+                    int di = i32(a, e + esz + 4);
+                    String path = di >= 0 && di < gpool.length ? gpool[di] : null;
+                    if (path != null && path.indexOf('/') > 0 && isImagePath(path) && zipNames.contains(path)) { c.image[i] = path; continue; }
+                }
+                entryRefs(a, e, gpool, kept);
+            }
+            // entries must not overlap or share an offset, otherwise rebuilding the chunk would be wrong
+            Integer[] order = new Integer[n]; for (int i = 0; i < n; i++) order[i] = i;
+            final TChunk cc = c; Arrays.sort(order, (x, y) -> Integer.compare(cc.eoff[x], cc.eoff[y]));
+            int lastEnd = -1;
+            for (int i : order) {
+                if (c.eoff[i] < 0) continue;
+                if (c.eoff[i] < lastEnd) { c.slots = 0; return c; }
+                lastEnd = c.eoff[i] + c.esize[i];
+            }
+            c.ok = true;
+        } catch (RuntimeException ex) { c.slots = 0; c.ok = false; }
+        return c;
+    }
+
+    /** Builds the type chunk again without the dropped entries. Returns null when nothing is left. */
+    static byte[] rebuildType(byte[] a, TChunk c) {
+        boolean sparse = (c.flags & 1) != 0, off16 = (c.flags & 2) != 0;
+        List<Integer> keep = new ArrayList<>();
+        for (int i = 0; i < c.slots; i++) if (c.eoff[i] >= 0 && !c.drop[i]) keep.add(i);
+        if (keep.isEmpty()) return null;
+        int n = sparse ? keep.size() : c.count;
+        int arr = ((sparse ? 4 * n : off16 ? 2 * n : 4 * n) + 3) & ~3;
+        int newEs = c.hdr + arr;
+        ByteArrayOutputStream data = new ByteArrayOutputStream(); int[] newOff = new int[c.slots]; Arrays.fill(newOff, -1);
+        for (int i : keep) {
+            newOff[i] = data.size(); data.write(a, c.pos + c.entriesStart + c.eoff[i], c.esize[i]);
+            while (data.size() % 4 != 0) data.write(0);
+        }
+        byte[] r = new byte[newEs + data.size()];
+        System.arraycopy(a, c.pos, r, 0, c.hdr);
+        p32(r, 4, r.length); p32(r, 16, newEs);
+        if (sparse) {
+            p32(r, 12, n);
+            for (int j = 0; j < keep.size(); j++) {
+                int slot = keep.get(j), o = c.hdr + 4 * j;
+                r[o] = (byte) c.slotIdx[slot]; r[o + 1] = (byte) (c.slotIdx[slot] >> 8);
+                int v = newOff[slot] / 4; r[o + 2] = (byte) v; r[o + 3] = (byte) (v >> 8);
+            }
+        } else if (off16) {
+            for (int i = 0; i < n; i++) {
+                int v = newOff[i] < 0 ? 0xFFFF : newOff[i] / 4;
+                if (v >= 0xFFFF && newOff[i] >= 0) throw new IllegalStateException("offset16 overflow");
+                r[c.hdr + 2 * i] = (byte) v; r[c.hdr + 2 * i + 1] = (byte) (v >> 8);
+            }
+            for (int o = c.hdr + 2 * n; o < newEs; o++) r[o] = 0;
+        } else {
+            for (int i = 0; i < n; i++) p32(r, c.hdr + 4 * i, newOff[i] < 0 ? 0xFFFFFFFF : newOff[i]);
+        }
+        byte[] d = data.toByteArray(); System.arraycopy(d, 0, r, newEs, d.length);
+        return r;
+    }
+
+    /**
+     * Keeps, for every image that exists in several screen densities, only the copy Android would pick for the given densities.
+     * Only plain file references to png/webp/jpg/gif are touched, and only when ALL copies of that entry are such files in the same
+     * configuration apart from density. Resource ids, entry counts and everything else stay as they are.
+     */
+    static DpiResult pruneDensity(byte[] a, int[] targets, Set<String> zipNames) {
+        if (a.length < 12 || u16(a, 0) != 0x0002) throw new IllegalArgumentException("Invalid resources.arsc");
+        DpiResult r = new DpiResult();
+        int total = (int) Math.min(u32(a, 4), a.length), p0 = u16(a, 2);
+        String[] gpool = null; Set<String> kept = new HashSet<>(), gone = new HashSet<>();
+        List<TChunk> chunks = new ArrayList<>(); Map<Integer, TChunk> byPos = new HashMap<>();
+        int pp = p0, pkgNo = 0;
+        while (pp + 8 <= total) {                       // pass 1: read every type chunk
+            int type = u16(a, pp), size = i32(a, pp + 4); if (size <= 0) throw new IllegalStateException("chunk size <= 0");
+            if (type == 0x0001 && gpool == null) gpool = readPool(a, pp);
+            else if (type == 0x0200) {
+                if (gpool == null) throw new IllegalStateException("package before the string pool");
+                int q = pp + u16(a, pp + 2), end = pp + size;
+                while (q + 8 <= end) {
+                    int t = u16(a, q), s = i32(a, q + 4); if (s <= 0) throw new IllegalStateException("inner chunk size <= 0");
+                    if (t == 0x0201) {
+                        TChunk c = parseType(a, q, pkgNo, gpool, zipNames, kept);
+                        if (!c.ok) { try { collectRefs(a, q, gpool, kept); } catch (RuntimeException ex) { r.refsUnsafe = true; } }
+                        chunks.add(c); byPos.put(q, c);
+                    }
+                    q += s;
+                }
+                pkgNo++;
+            }
+            pp += size;
+        }
+        Map<String, List<TChunk>> groups = new LinkedHashMap<>();
+        for (TChunk c : chunks) if (c.ok) groups.computeIfAbsent(c.key, k -> new ArrayList<>()).add(c);
+        for (List<TChunk> g : groups.values()) {        // pass 2: decide per entry
+            if (g.size() < 2) continue;
+            Map<Integer, List<int[]>> byEntry = new TreeMap<>();
+            for (int gi = 0; gi < g.size(); gi++) {
+                TChunk c = g.get(gi);
+                for (int sl = 0; sl < c.slots; sl++) if (c.eoff[sl] >= 0) byEntry.computeIfAbsent(c.slotIdx[sl], k -> new ArrayList<>()).add(new int[]{gi, sl});
+            }
+            for (List<int[]> cand : byEntry.values()) {
+                if (cand.size() < 2) continue;
+                boolean eligible = true; Set<Integer> effs = new LinkedHashSet<>();
+                for (int[] cs : cand) {
+                    TChunk c = g.get(cs[0]);
+                    if (c.image[cs[1]] == null || c.density == DENSITY_ANY || c.density == DENSITY_NONE || !effs.add(c.eff)) { eligible = false; break; }
+                }
+                if (!eligible) continue;
+                int[] av = new int[effs.size()]; int k = 0; for (int d : effs) av[k++] = d;
+                Set<Integer> keepD = new HashSet<>(); for (int t : targets) keepD.add(bestDensity(t, av));
+                for (int[] cs : cand) {
+                    TChunk c = g.get(cs[0]);
+                    if (!keepD.contains(c.eff)) { c.drop[cs[1]] = true; r.removedEntries++; r.byDensity.merge(dpiLabel(c.density), 1, Integer::sum); }
+                }
+            }
+        }
+        for (TChunk c : chunks) for (int sl = 0; sl < c.slots; sl++) {
+            if (c.image[sl] != null) (c.drop[sl] ? gone : kept).add(c.image[sl]);
+        }
+        if (!r.refsUnsafe) for (String g : gone) if (!kept.contains(g) && zipNames.contains(g)) r.deletePaths.add(g);
+        ByteArrayOutputStream out = new ByteArrayOutputStream(a.length); out.write(a, 0, p0);
+        pp = p0;                                        // pass 3: write the table again
+        while (pp + 8 <= total) {
+            int type = u16(a, pp), size = i32(a, pp + 4);
+            if (type == 0x0200) {
+                int pHdr = u16(a, pp + 2); ByteArrayOutputStream po = new ByteArrayOutputStream(size); po.write(a, pp, pHdr);
+                int q = pp + pHdr, end = pp + size;
+                while (q + 8 <= end) {
+                    int t = u16(a, q), s = i32(a, q + 4);
+                    TChunk c = t == 0x0201 ? byPos.get(q) : null;
+                    if (c != null && c.ok && c.any()) {
+                        byte[] nb = rebuildType(a, c);
+                        if (nb == null) r.droppedChunks++; else { r.changedChunks++; po.write(nb, 0, nb.length); }
+                    } else po.write(a, q, s);
+                    q += s;
+                }
+                byte[] pb = po.toByteArray(); p32(pb, 4, pb.length); out.write(pb, 0, pb.length);
+            } else out.write(a, pp, size);
+            pp += size;
+        }
+        byte[] res = out.toByteArray(); p32(res, 4, res.length); r.data = res;
+        return r;
+    }
+
     // ---------------------------------------------------------------- PNG khong mat du lieu
     static final byte[] PNG_SIG = {(byte) 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
     static final Set<String> STRIP = new HashSet<>(Arrays.asList("tEXt", "zTXt", "iTXt", "tIME", "pHYs", "hIST", "sPLT"));
@@ -455,7 +778,11 @@ public final class ApkCleaner {
 
     /** Options of one cleaning run. All fields are plain values so Kotlin/CLI code can set them directly. */
     public static final class Options {
-        /** Apply the junk list of the "APK Junk Cleanup" patch (META-INF leftovers, .properties, .proto, kotlin/, ...). */
+        /**
+         * Safe junk rules: licenses/notices, .proto, tracker lists, library version marker files (*.properties, *.version of
+         * ad/analytics/Play Services libraries...), org/jacoco/, META-INF/maven and META-INF/proguard. The files known to crash some apps
+         * (EXCLUDED_ROOT_CALLS) are kept unless aggressive is set.
+         */
         public boolean junk = true;
         /** Comma separated ABI names to keep inside lib/ (e.g. "armeabi-v7a"); null or empty = keep all. */
         public String keepAbi;
@@ -471,10 +798,17 @@ public final class ApkCleaner {
         public String langs;
         /** Lossless PNG re-compression. */
         public boolean png;
+        /** Lower minSdkVersion in AndroidManifest.xml to this API level (0 = leave as is). Never raises it. */
+        public int minSdk;
         /**
-         * Also apply the riskier rules (implies junk): library version/metadata files (*.properties, *.version, ...) and the folders
-         * kotlin/, org/joda/, com/clevertap/, services/, assets/audience_network*, and every other META-INF entry.
-         * Some apps read these at runtime and crash or misbehave without them.
+         * Densities to keep for images that exist in several densities (e.g. "xxhdpi" or "xhdpi,xxhdpi" or "420"); null or empty = keep all.
+         * For every image the copy Android would choose for each listed density is kept, the other densities of the same image are removed.
+         */
+        public String dpi;
+        /**
+         * Also apply the riskier rules (implies junk): the library files known to crash some apps (EXCLUDED_ROOT_CALLS: play-services-auth/base/tasks,
+         * firebase-common/messaging/..., core-common, ...) and the folders kotlin/, org/joda/, com/clevertap/, services/, assets/audience_network*,
+         * and every other META-INF entry. Some apps read these at runtime and crash or misbehave without them.
          */
         public boolean aggressive;
         /** Comma separated extra paths/globs that must never be deleted (* = any characters, ? = one character), e.g. "play-services-base.properties,*.kotlin_module". */
@@ -484,7 +818,7 @@ public final class ApkCleaner {
 
         /** true when this run has anything to do (any option beyond defaults is set). */
         public boolean hasWork() {
-            return junk || aggressive || notEmpty(keepAbi) || dropBaseline || adsAssets || manifestAds || notEmpty(langs) || png;
+            return junk || aggressive || notEmpty(keepAbi) || dropBaseline || adsAssets || manifestAds || notEmpty(langs) || png || minSdk > 0 || notEmpty(dpi);
         }
     }
 
@@ -495,6 +829,21 @@ public final class ApkCleaner {
     }
 
     static boolean notEmpty(String s) { return s != null && !s.trim().isEmpty(); }
+
+    /**
+     * Language list -> language codes as Android stores them. "en-rUS", "en-US", "en_US" and "b+en+US" all mean "en" (every region of a language is kept),
+     * and "id", "he", "yi" become the old codes "in", "iw", "ji" that Android uses in resource tables.
+     */
+    static Set<String> normLangs(String s) {
+        Set<String> r = new LinkedHashSet<>();
+        for (String t : csv(s, true)) {
+            String l = t.startsWith("b+") ? t.substring(2).split("\\+")[0] : t.split("[-_]")[0];
+            if (l.length() < 2 || l.length() > 3 || !l.chars().allMatch(ch -> ch >= 'a' && ch <= 'z'))
+                throw new IllegalArgumentException("'" + t + "' is not a language code (use codes such as en,vi,pt-BR)");
+            r.add(l.equals("id") ? "in" : l.equals("he") ? "iw" : l.equals("yi") ? "ji" : l);
+        }
+        return r;
+    }
 
     static Set<String> csv(String s, boolean lower) {
         Set<String> set = new LinkedHashSet<>();
@@ -517,6 +866,8 @@ public final class ApkCleaner {
                 case "--manifest-generic-perms": o.genericPerms = true; break;
                 case "--png": o.png = true; break;
                 case "--langs": o.langs = args[++i]; break;
+                case "--dpi": o.dpi = args[++i]; break;
+                case "--lower-sdk": o.minSdk = Integer.parseInt(args[++i]); break;
                 default: pos.add(args[i]);
             }
         }
@@ -536,13 +887,13 @@ public final class ApkCleaner {
             if (in.getCanonicalFile().equals(out.getCanonicalFile())) throw new IllegalArgumentException("out must differ from in");
         }
         Set<String> keepAbi = csv(opt.keepAbi, false); if (keepAbi.isEmpty()) keepAbi = null;
-        Set<String> langs = csv(opt.langs, true); if (langs.isEmpty()) langs = null;
+        Set<String> langs = normLangs(opt.langs); if (langs.isEmpty()) langs = null;
         boolean junkOn = opt.junk || opt.aggressive;
         Ctx cx = new Ctx(); cx.keepAbi = keepAbi; cx.dropBaseline = opt.dropBaseline; cx.junkOn = junkOn; cx.aggressive = opt.aggressive;
         cx.prot = compile(PROTECTED);
         for (String g : csv(opt.protect, false)) cx.userProtect.add(Pattern.compile(globToRegex(g)));
-        for (String re : JUNK_REGEX) (isTier2Regex(re) ? cx.junk2 : cx.junk1).add(Pattern.compile(re));
-        for (String s : EXACT_JUNK) (isTier2Name(s) ? cx.exact2 : cx.exact1).add(s);
+        for (String re : JUNK_REGEX) cx.junk.add(Pattern.compile(re));
+        cx.exact.addAll(Arrays.asList(EXACT_JUNK));
         boolean dryRun = opt.dryRun;
 
         Result res = new Result(); res.inputSize = in.length();
@@ -567,15 +918,24 @@ public final class ApkCleaner {
                     catch (RuntimeException ex) { cx.shieldDeep = true; notes.add("WARNING: could not read resources.arsc (" + ex.getMessage() + "): all files in sub-folders are protected from junk rules"); }
                 }
                 notes.add("Junk rules: package " + pkg + (cx.excludedApp ? " is on the exclusion list: " + EXCLUDED_ROOT_CALLS.length + " known-sensitive library files are kept" : "")
-                        + "; " + cx.refs.size() + " files used by the resource table are protected" + (opt.aggressive ? "; AGGRESSIVE mode" : "; safe mode (add --clean-aggressive for version files, kotlin/, org/joda/, other META-INF)"));
+                        + "; " + cx.refs.size() + " files used by the resource table are protected" + (opt.aggressive ? "; AGGRESSIVE mode" : "; safe mode (add --clean-aggressive for the known-sensitive library files, kotlin/, org/joda/, other META-INF)"));
             }
-            if (opt.manifestAds) {
-                Ent me = byName.get("AndroidManifest.xml"); List<String> rm = new ArrayList<>();
+            if (opt.minSdk > 0 || opt.manifestAds) {
+                Ent me = byName.get("AndroidManifest.xml");
                 if (me == null) throw new IOException("AndroidManifest.xml not found in the APK");
-                byte[] nm = stripManifest(readEntry(f, me), opt.genericPerms, rm);
-                repl.put("AndroidManifest.xml", nm);
-                notes.add("Manifest: removed " + rm.size() + " ad entries" + (opt.genericPerms ? " (including generic permissions)" : ""));
-                for (String s : rm) notes.add("    - " + s);
+                byte[] man = readEntry(f, me);
+                if (opt.minSdk > 0) {
+                    if (opt.minSdk > 99) throw new IllegalArgumentException("--lower-sdk: " + opt.minSdk + " is not a valid API level (use 1..99)");
+                    man = lowerMinSdk(man, opt.minSdk, notes);
+                    if (opt.minSdk < 28) warnDex(f, all, opt.minSdk, notes);
+                }
+                if (opt.manifestAds) {
+                    List<String> rm = new ArrayList<>();
+                    man = stripManifest(man, opt.genericPerms, rm);
+                    notes.add("Manifest: removed " + rm.size() + " ad entries" + (opt.genericPerms ? " (including generic permissions)" : ""));
+                    for (String s : rm) notes.add("    - " + s);
+                }
+                repl.put("AndroidManifest.xml", man);
             }
             if (langs != null) {
                 Ent ae = byName.get("resources.arsc");
@@ -586,6 +946,20 @@ public final class ApkCleaner {
                         + ar.removedBytes + " B) of languages " + ar.byLang + "; " + ar.deletePaths.size() + " files used only by them deleted"
                         + (ar.refsUnsafe ? " [WARNING: could not determine which files they use -> no files deleted]" : ""));
                 for (String s : ar.deletePaths) extraDelete.put(s, "file of removed language");
+            }
+            if (notEmpty(opt.dpi)) {
+                int[] targets = parseDensities(opt.dpi);
+                Ent ae = byName.get("resources.arsc");
+                if (ae == null) throw new IOException("resources.arsc not found in the APK");
+                byte[] cur = repl.containsKey("resources.arsc") ? repl.get("resources.arsc") : readEntry(f, ae);
+                DpiResult dr = pruneDensity(cur, targets, names);
+                repl.put("resources.arsc", dr.data);
+                notes.add("Densities: keeping the copy Android picks for " + opt.dpi + "; " + dr.removedEntries + " image entries removed from "
+                        + dr.changedChunks + " type chunks (" + dr.droppedChunks + " chunks became empty and were dropped), by density " + dr.byDensity + "; "
+                        + dr.deletePaths.size() + " image files no longer used are deleted"
+                        + (dr.refsUnsafe ? " [WARNING: could not read some resource entries -> no files deleted]" : "")
+                        + (dr.skippedGroups > 0 ? " [" + dr.skippedGroups + " groups left untouched: unsupported entry format]" : ""));
+                for (String s : dr.deletePaths) extraDelete.put(s, "image of removed density");
             }
             if (opt.png) {
                 long saved = 0; int n = 0;
@@ -615,7 +989,14 @@ public final class ApkCleaner {
             if (!dryRun) {
                 File parent = out.getAbsoluteFile().getParentFile();
                 if (parent != null) parent.mkdirs();
-                write(f, keep, out);
+                // Ghi ra file .part roi doi ten: neu loi giua chung thi khong de lai file APK cat dut.
+                File part = new File(out.getPath() + ".part");
+                try {
+                    write(f, keep, part);
+                    java.nio.file.Files.move(part.toPath(), out.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                } finally {
+                    part.delete(); // khong con gi de xoa sau khi doi ten thanh cong
+                }
                 res.outputSize = out.length();
             }
         }
@@ -675,15 +1056,11 @@ public final class ApkCleaner {
 
     /** State shared by the per-entry rules of one run. */
     static final class Ctx {
-        List<Pattern> prot = new ArrayList<>(), userProtect = new ArrayList<>(), junk1 = new ArrayList<>(), junk2 = new ArrayList<>();
-        Set<String> exact1 = new HashSet<>(), exact2 = new HashSet<>(), keepAbi, refs = new HashSet<>();
+        List<Pattern> prot = new ArrayList<>(), userProtect = new ArrayList<>(), junk = new ArrayList<>();
+        Set<String> exact = new HashSet<>(), knownCrash = new HashSet<>(Arrays.asList(EXCLUDED_ROOT_CALLS)), keepAbi, refs = new HashSet<>();
         boolean dropBaseline, junkOn, aggressive, excludedApp, shieldDeep;
         boolean isUserProtected(String n) { for (Pattern p : userProtect) if (p.matcher(n).matches()) return true; return false; }
     }
-
-    /** Tier 2 = library version/metadata files that some SDKs read at runtime (crash evidence from the original patch's exclusion list). */
-    static boolean isTier2Regex(String re) { return re.contains("properties$") || re.equals(".*\\.version$") || re.equals(".*_VERSION$") || re.contains("jetty-dir"); }
-    static boolean isTier2Name(String s) { return s.endsWith(".properties") || s.equals("jetty-dir.css"); }
 
     static String globToRegex(String g) {
         StringBuilder sb = new StringBuilder();
@@ -711,16 +1088,18 @@ public final class ApkCleaner {
         // shield: resources, assets, native libs and anything the resource table points to are never "junk"
         if (n.startsWith("res/") || n.startsWith("assets/") || n.startsWith("lib/") || c.refs.contains(n)) return null;
         if (c.shieldDeep && n.indexOf('/') > 0 && !n.startsWith("META-INF/")) return null;
-        // some apps are known to crash without these files (original patch exclusion list)
-        if (c.excludedApp && Arrays.asList(EXCLUDED_ROOT_CALLS).contains(n)) return null;
-        for (Pattern p : c.junk1) if (p.matcher(n).matches()) return "junk pattern (safe)";
-        if (c.exact1.contains(n)) return "junk file name (safe)";
+        // Files that made some apps crash (original patch exclusion list): kept, except in aggressive mode for apps that are not on the exclusion list.
+        if (c.knownCrash.contains(n)) return c.aggressive && !c.excludedApp ? "known-sensitive library file (aggressive)" : null;
+        // safe rules
+        for (Pattern p : c.junk) if (p.matcher(n).matches()) return "junk pattern";
+        if (c.exact.contains(n)) return "junk file name";
+        if (n.startsWith("org/jacoco/")) return "junk folder org/jacoco/";
+        if (n.startsWith("META-INF/maven/") || n.startsWith("META-INF/proguard/")) return "META-INF build leftovers";
         if (!c.aggressive) return null;
-        for (Pattern p : c.junk2) if (p.matcher(n).matches()) return "library metadata pattern";
-        if (c.exact2.contains(n)) return "library metadata name";
+        // aggressive-only rules
         if (n.startsWith("kotlin/")) return "kotlin/ folder";
         for (String d : JUNK_DIRS) {
-            if (d.equals("assets/dexopt/")) continue;
+            if (d.equals("assets/dexopt/") || d.equals("org/jacoco/")) continue;
             if (n.startsWith(d)) return "junk folder " + d;
         }
         if (n.startsWith("META-INF/")) return "other META-INF";
